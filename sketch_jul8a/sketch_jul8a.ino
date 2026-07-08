@@ -30,6 +30,8 @@
 #include <ESP8266WebServer.h>
 #include <EEPROM.h>
 #include <ESP8266mDNS.h>
+#define FASTLED_INTERNAL
+#include <FastLED.h>
 
 
 // ════════════════════════════════════════════════════════════
@@ -40,6 +42,31 @@
 //    If EEPROM[0] != CONFIG_MAGIC → no config → AP setup mode
 #define EEPROM_SIZE   512
 #define CONFIG_MAGIC  0xA5
+
+enum LedEffect {
+  EFFECT_SOLID = 0,
+  EFFECT_RAINBOW,
+  EFFECT_BREATHING,
+  EFFECT_COLOR_WIPE,
+  EFFECT_THEATER_CHASE,
+  EFFECT_FIRE,
+  EFFECT_POLICE,
+  EFFECT_OCEAN,
+  EFFECT_CHRISTMAS,
+  EFFECT_COUNT
+};
+
+static const char* const LED_EFFECT_NAMES[] = {
+  "Solid",
+  "Rainbow",
+  "Breathing",
+  "Color Wipe",
+  "Theater Chase",
+  "Fire",
+  "Police",
+  "Ocean",
+  "Christmas"
+};
 
 // ── Config struct – everything stored in EEPROM ──────────────
 struct Config {
@@ -60,7 +87,27 @@ struct Config {
 
   char deviceName[33];       // Human-readable device name (shown in HA)
   char roomName[33];         // Room name (used in HA device area)
-};                           // Total: ≈ 393 bytes  (well within 512)
+
+  // -- LED Config (Defaults) --
+  uint16_t configVersion;    // Offset alignment helper & versioning
+  bool     ledEnabled;
+  uint16_t ledCount;
+  uint8_t  ledDefaultBrightness;
+  uint8_t  ledDefaultEffect;
+  uint8_t  ledDefaultR;
+  uint8_t  ledDefaultG;
+  uint8_t  ledDefaultB;
+  uint8_t  ledDefaultSpeed;
+
+  // -- LED State (Runtime State) --
+  bool     ledState;
+  uint8_t  ledBrightness;
+  uint8_t  ledEffect;
+  uint8_t  ledR;
+  uint8_t  ledG;
+  uint8_t  ledB;
+  uint8_t  ledSpeed;
+};                           // Total: ≈ 414 bytes  (well within 512)
 
 Config cfg;                  // active configuration in RAM
 
@@ -72,12 +119,40 @@ void loadConfig()
   EEPROM.begin(EEPROM_SIZE);
   EEPROM.get(0, cfg);
   EEPROM.end();
+
+  // If valid magic but older version, migrate settings
+  if (cfg.magic == CONFIG_MAGIC) {
+    if (cfg.configVersion != 2) {
+      Serial.println("Migrating configuration to version 2...");
+      cfg.configVersion = 2;
+      cfg.ledEnabled = true;
+      cfg.ledCount = 45; // default count 45 (static)
+      cfg.ledDefaultBrightness = 128;
+      cfg.ledDefaultEffect = EFFECT_SOLID;
+      cfg.ledDefaultR = 255;
+      cfg.ledDefaultG = 255;
+      cfg.ledDefaultB = 255;
+      cfg.ledDefaultSpeed = 128;
+
+      cfg.ledState = false;
+      cfg.ledBrightness = 128;
+      cfg.ledEffect = EFFECT_SOLID;
+      cfg.ledR = 255;
+      cfg.ledG = 255;
+      cfg.ledB = 255;
+      cfg.ledSpeed = 128;
+
+      saveConfig();
+      Serial.println("Configuration migrated successfully.");
+    }
+  }
 }
 
 // Save cfg struct to EEPROM
 void saveConfig()
 {
   cfg.magic = CONFIG_MAGIC;
+  cfg.configVersion = 2;
   EEPROM.begin(EEPROM_SIZE);
   EEPROM.put(0, cfg);
   EEPROM.commit();
@@ -111,6 +186,10 @@ bool configValid()
 #define FW_VERSION "1.0.2"
 static const char* MASK = "********";
 
+#define LED_PIN          D7    // GPIO13 – WS2811 LED strip data pin
+#define LED_CHIPSET      WS2811
+#define LED_COLOR_ORDER  RGB
+
 
 // ════════════════════════════════════════════════════════════
 //  4.  GLOBAL OBJECTS
@@ -122,12 +201,29 @@ ESP8266WebServer server(80);
 // Flag set in setup() – true = normal mode, false = AP setup mode
 bool normalMode = false;
 
+// FastLED definitions
+#define MAX_LEDS 300
+CRGB leds[MAX_LEDS];
+
+// LED state transition & animation variables
+uint8_t currentLedBrightness = 0;
+uint8_t targetLedBrightness = 0;
+unsigned long lastBrightnessTransitionTime = 0;
+unsigned long lastLedStateChangeTime = 0;
+bool ledStateNeedsSaving = false;
+unsigned long lastLedEffectUpdate = 0;
+
 
 // ════════════════════════════════════════════════════════════
 //  5.  STATE & SSE
 // ════════════════════════════════════════════════════════════
 bool       relayState = false;   // true = ON, false = OFF
 WiFiClient sseClient;            // holds the open SSE connection
+
+// Forward declaration for LED effect helper
+String getEffectName(uint8_t effectIndex);
+static String jsonStr(const String& body, const String& key);
+static int jsonInt(const String& body, const String& key);
 
 
 // ════════════════════════════════════════════════════════════
@@ -164,12 +260,412 @@ void ssePush()
   json += "\"mqtt\":"       + String(client.connected() ? "true" : "false") + ",";
   json += "\"uptime\":\""   + String(uptime)                        + "\",";
   json += "\"firmware\":\"" FW_VERSION "\",";
-  json += "\"device\":\""   + String(cfg.deviceName)               + "\"";
+  json += "\"device\":\""   + String(cfg.deviceName)               + "\",";
+  json += "\"ledEnabled\":" + String(cfg.ledEnabled ? "true" : "false") + ",";
+  json += "\"ledState\":"   + String(cfg.ledState ? "true" : "false") + ",";
+  json += "\"ledBrightness\":" + String(cfg.ledBrightness) + ",";
+  json += "\"ledEffect\":\"" + getEffectName(cfg.ledEffect) + "\",";
+  json += "\"ledSpeed\":"   + String(cfg.ledSpeed) + ",";
+  json += "\"ledR\":"       + String(cfg.ledR) + ",";
+  json += "\"ledG\":"       + String(cfg.ledG) + ",";
+  json += "\"ledB\":"       + String(cfg.ledB);
   json += "}";
 
   sseClient.print("data: ");
   sseClient.print(json);
   sseClient.print("\n\n");
+}
+
+
+// ════════════════════════════════════════════════════════════
+//  6a. LED CONTROL SUBSYSTEM
+// ════════════════════════════════════════════════════════════
+
+static long parseHex(const String& s)
+{
+  long val = 0;
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char c = s[i];
+    val <<= 4;
+    if (c >= '0' && c <= '9') val += (c - '0');
+    else if (c >= 'a' && c <= 'f') val += (10 + (c - 'a'));
+    else if (c >= 'A' && c <= 'F') val += (10 + (c - 'A'));
+  }
+  return val;
+}
+
+LedEffect parseEffectName(const String& name)
+{
+  for (int i = 0; i < EFFECT_COUNT; i++) {
+    if (name.equalsIgnoreCase(LED_EFFECT_NAMES[i])) {
+      return (LedEffect)i;
+    }
+  }
+  return EFFECT_SOLID;
+}
+
+String getEffectName(uint8_t effectIndex)
+{
+  if (effectIndex < EFFECT_COUNT) {
+    return LED_EFFECT_NAMES[effectIndex];
+  }
+  return "Solid";
+}
+
+void setupLED()
+{
+  if (cfg.ledEnabled) {
+    static bool initialized = false;
+    if (!initialized) {
+      if (cfg.ledCount > MAX_LEDS) cfg.ledCount = MAX_LEDS;
+      FastLED.addLeds<LED_CHIPSET, LED_PIN, LED_COLOR_ORDER>(leds, MAX_LEDS);
+      FastLED.setBrightness(0);
+      FastLED.clear();
+      FastLED.show();
+      initialized = true;
+      Serial.println("FastLED Initialized");
+    }
+  }
+}
+
+void publishLEDState(); // forward declaration
+
+void updateLED()
+{
+  targetLedBrightness = cfg.ledState ? cfg.ledBrightness : 0;
+  ledStateNeedsSaving = true;
+  lastLedStateChangeTime = millis();
+}
+
+void setLEDColor(uint8_t r, uint8_t g, uint8_t b)
+{
+  cfg.ledR = r;
+  cfg.ledG = g;
+  cfg.ledB = b;
+  updateLED();
+}
+
+void setLEDEffect(const String& effectName)
+{
+  cfg.ledEffect = (uint8_t)parseEffectName(effectName);
+  updateLED();
+}
+
+unsigned long getEffectInterval()
+{
+  if (cfg.ledSpeed == 0) return 300;
+  return 300 - ((unsigned long)cfg.ledSpeed * 290 / 255);
+}
+
+void updateLedTransition()
+{
+  if (millis() - lastBrightnessTransitionTime >= 5) {
+    lastBrightnessTransitionTime = millis();
+    if (currentLedBrightness < targetLedBrightness) {
+      currentLedBrightness++;
+      FastLED.setBrightness(currentLedBrightness);
+      FastLED.show();
+    } else if (currentLedBrightness > targetLedBrightness) {
+      currentLedBrightness--;
+      FastLED.setBrightness(currentLedBrightness);
+      FastLED.show();
+    }
+  }
+}
+
+void runLEDEffects()
+{
+  if (!cfg.ledEnabled) return;
+
+  updateLedTransition();
+
+  static bool wasZero = true;
+  if (currentLedBrightness > 0) {
+    wasZero = false;
+  } else {
+    if (!wasZero) {
+      FastLED.clear();
+      FastLED.show();
+      wasZero = true;
+    }
+    return;
+  }
+
+  switch ((LedEffect)cfg.ledEffect) {
+    case EFFECT_SOLID:
+      for (int i = 0; i < cfg.ledCount; i++) {
+        leds[i] = CRGB(cfg.ledR, cfg.ledG, cfg.ledB);
+      }
+      FastLED.show();
+      break;
+    case EFFECT_RAINBOW:
+      {
+        static uint8_t hue = 0;
+        if (millis() - lastLedEffectUpdate >= getEffectInterval()) {
+          lastLedEffectUpdate = millis();
+          hue++;
+          fill_rainbow(leds, cfg.ledCount, hue, 7);
+          FastLED.show();
+        }
+      }
+      break;
+    case EFFECT_BREATHING:
+      {
+        static uint8_t breatheIndex = 0;
+        if (millis() - lastLedEffectUpdate >= (getEffectInterval() / 4 + 1)) {
+          lastLedEffectUpdate = millis();
+          breatheIndex++;
+          uint8_t breathVal = sin8(breatheIndex);
+          for (int i = 0; i < cfg.ledCount; i++) {
+            leds[i] = CRGB(
+              (cfg.ledR * breathVal) / 255,
+              (cfg.ledG * breathVal) / 255,
+              (cfg.ledB * breathVal) / 255
+            );
+          }
+          FastLED.show();
+        }
+      }
+      break;
+    case EFFECT_COLOR_WIPE:
+      {
+        static int wipePos = 0;
+        if (wipePos >= cfg.ledCount) wipePos = 0;
+        if (millis() - lastLedEffectUpdate >= getEffectInterval()) {
+          lastLedEffectUpdate = millis();
+          leds[wipePos] = CRGB(cfg.ledR, cfg.ledG, cfg.ledB);
+          FastLED.show();
+          wipePos++;
+          if (wipePos >= cfg.ledCount) {
+            wipePos = 0;
+            for (int i = 0; i < cfg.ledCount; i++) leds[i] = CRGB::Black;
+          }
+        }
+      }
+      break;
+    case EFFECT_THEATER_CHASE:
+      {
+        static int chaseFrame = 0;
+        if (millis() - lastLedEffectUpdate >= getEffectInterval()) {
+          lastLedEffectUpdate = millis();
+          for (int i = 0; i < cfg.ledCount; i++) {
+            if ((i + chaseFrame) % 3 == 0) {
+              leds[i] = CRGB(cfg.ledR, cfg.ledG, cfg.ledB);
+            } else {
+              leds[i] = CRGB::Black;
+            }
+          }
+          FastLED.show();
+          chaseFrame = (chaseFrame + 1) % 3;
+        }
+      }
+      break;
+    case EFFECT_FIRE:
+      {
+        static uint8_t heat[MAX_LEDS] = {0};
+        if (millis() - lastLedEffectUpdate >= getEffectInterval()) {
+          lastLedEffectUpdate = millis();
+          for (int i = 0; i < cfg.ledCount; i++) {
+            heat[i] = qsub8(heat[i], random8(0, ((55 * 10) / cfg.ledCount) + 2));
+          }
+          for (int k = cfg.ledCount - 1; k >= 2; k--) {
+            heat[k] = (heat[k - 1] + heat[k - 2] + heat[k - 2]) / 3;
+          }
+          if (random8() < 120) {
+            int y = random8(7);
+            if (y < cfg.ledCount) {
+              heat[y] = qadd8(heat[y], random8(160, 255));
+            }
+          }
+          for (int j = 0; j < cfg.ledCount; j++) {
+            leds[j] = HeatColor(heat[j]);
+          }
+          FastLED.show();
+        }
+      }
+      break;
+    case EFFECT_POLICE:
+      {
+        static bool policeState = false;
+        if (millis() - lastLedEffectUpdate >= (getEffectInterval() * 2)) {
+          lastLedEffectUpdate = millis();
+          policeState = !policeState;
+          int half = cfg.ledCount / 2;
+          for (int i = 0; i < cfg.ledCount; i++) {
+            if (i < half) {
+              leds[i] = policeState ? CRGB::Red : CRGB::Black;
+            } else {
+              leds[i] = policeState ? CRGB::Black : CRGB::Blue;
+            }
+          }
+          FastLED.show();
+        }
+      }
+      break;
+    case EFFECT_OCEAN:
+      {
+        static uint8_t oceanStartIndex = 0;
+        if (millis() - lastLedEffectUpdate >= getEffectInterval()) {
+          lastLedEffectUpdate = millis();
+          oceanStartIndex += 1;
+          uint8_t colorIndex = oceanStartIndex;
+          for (int i = 0; i < cfg.ledCount; i++) {
+            leds[i] = ColorFromPalette(OceanColors_p, colorIndex, 255, LINEARBLEND);
+            colorIndex += 3;
+          }
+          FastLED.show();
+        }
+      }
+      break;
+    case EFFECT_CHRISTMAS:
+      {
+        static bool xmasState = false;
+        if (millis() - lastLedEffectUpdate >= (getEffectInterval() * 2)) {
+          lastLedEffectUpdate = millis();
+          xmasState = !xmasState;
+          for (int i = 0; i < cfg.ledCount; i++) {
+            if ((i % 2 == 0) ^ xmasState) {
+              leds[i] = CRGB::Red;
+            } else {
+              leds[i] = CRGB::Green;
+            }
+          }
+          FastLED.show();
+        }
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+void processLEDCommand(const String& jsonPayload)
+{
+  if (!cfg.ledEnabled) {
+    cfg.ledState = false;
+    publishLEDState();
+    return;
+  }
+
+  bool changed = false;
+
+  // 1. Parse State
+  int stateIdx = jsonPayload.indexOf("\"state\"");
+  if (stateIdx >= 0) {
+    String stateVal = jsonStr(jsonPayload.substring(stateIdx), "state");
+    bool newState = (stateVal == "ON");
+    if (cfg.ledState != newState) {
+      cfg.ledState = newState;
+      changed = true;
+    }
+  }
+
+  // 2. Parse Brightness
+  int brightnessIdx = jsonPayload.indexOf("\"brightness\"");
+  if (brightnessIdx >= 0) {
+    int bVal = jsonInt(jsonPayload.substring(brightnessIdx), "brightness");
+    if (bVal >= 0 && bVal <= 255) {
+      if (cfg.ledBrightness != bVal) {
+        cfg.ledBrightness = bVal;
+        changed = true;
+      }
+    }
+  }
+
+  // 3. Parse Color
+  int colorIdx = jsonPayload.indexOf("\"color\"");
+  if (colorIdx >= 0) {
+    int rIdx = jsonPayload.indexOf("\"r\":", colorIdx);
+    int gIdx = jsonPayload.indexOf("\"g\":", colorIdx);
+    int bIdx = jsonPayload.indexOf("\"b\":", colorIdx);
+    
+    uint8_t newR = cfg.ledR;
+    uint8_t newG = cfg.ledG;
+    uint8_t newB = cfg.ledB;
+    bool colorChanged = false;
+
+    if (rIdx >= 0) {
+      int rVal = jsonInt(jsonPayload.substring(rIdx), "r");
+      if (rVal >= 0 && rVal <= 255) { newR = rVal; colorChanged = true; }
+    }
+    if (gIdx >= 0) {
+      int gVal = jsonInt(jsonPayload.substring(gIdx), "g");
+      if (gVal >= 0 && gVal <= 255) { newG = gVal; colorChanged = true; }
+    }
+    if (bIdx >= 0) {
+      int bVal = jsonInt(jsonPayload.substring(bIdx), "b");
+      if (bVal >= 0 && bVal <= 255) { newB = bVal; colorChanged = true; }
+    }
+
+    if (colorChanged && (cfg.ledR != newR || cfg.ledG != newG || cfg.ledB != newB)) {
+      setLEDColor(newR, newG, newB);
+      changed = true;
+    }
+  }
+
+  // 4. Parse Effect
+  int effectIdx = jsonPayload.indexOf("\"effect\"");
+  if (effectIdx >= 0) {
+    String effVal = jsonStr(jsonPayload.substring(effectIdx), "effect");
+    if (!effVal.isEmpty()) {
+      LedEffect newEff = parseEffectName(effVal);
+      if (cfg.ledEffect != (uint8_t)newEff) {
+        setLEDEffect(effVal);
+        changed = true;
+      }
+    }
+  }
+
+  // 5. Parse Speed
+  int speedIdx = jsonPayload.indexOf("\"speed\"");
+  if (speedIdx >= 0) {
+    int sVal = jsonInt(jsonPayload.substring(speedIdx), "speed");
+    if (sVal >= 0 && sVal <= 255) {
+      if (cfg.ledSpeed != sVal) {
+        cfg.ledSpeed = sVal;
+        changed = true;
+      }
+    }
+  }
+
+  if (changed) {
+    updateLED();
+    publishLEDState();
+  }
+}
+
+void publishLEDState()
+{
+  if (!client.connected()) return;
+
+  String json = "{";
+  json += "\"state\":\"" + String(cfg.ledState ? "ON" : "OFF") + "\",";
+  json += "\"brightness\":" + String(cfg.ledBrightness) + ",";
+  json += "\"color_mode\":\"rgb\",";
+  json += "\"color\":{";
+  json += "\"r\":" + String(cfg.ledR) + ",";
+  json += "\"g\":" + String(cfg.ledG) + ",";
+  json += "\"b\":" + String(cfg.ledB);
+  json += "},";
+  json += "\"effect\":\"" + getEffectName(cfg.ledEffect) + "\",";
+  json += "\"speed\":" + String(cfg.ledSpeed);
+  json += "}";
+
+  static String lastPublishedState = "";
+  if (json != lastPublishedState) {
+    lastPublishedState = json;
+    
+    String stateTopic = String(cfg.mqttPrefix) + "/light/state";
+    client.publish(stateTopic.c_str(), json.c_str(), true); // Retained
+    
+    client.publish(mqttTopic("led_effect").c_str(), getEffectName(cfg.ledEffect).c_str(), true); // Retained
+    
+    char countBuf[8];
+    sprintf(countBuf, "%d", cfg.ledCount);
+    client.publish(mqttTopic("led_count").c_str(), countBuf, true); // Retained
+  }
+
+  ssePush();
 }
 
 
@@ -269,16 +765,16 @@ void publishDiscovery()
   // Switch entity
   String sw;
   sw  = "{";
-  sw += "\"name\":\"" + name + "\",";
+  sw += "\"name\":\"fan\",";
   sw += "\"object_id\":\"fan\",";
   sw += "\"unique_id\":\"" + devId + "_fan\",";
   sw += "\"command_topic\":\"" + prefix + "/relay/set\",";
   sw += "\"state_topic\":\""   + prefix + "/relay/state\",";
   sw += "\"payload_on\":\"ON\",\"payload_off\":\"OFF\",";
   sw += "\"state_on\":\"ON\",\"state_off\":\"OFF\",";
-  sw += "\"availability_topic\":\"" + prefix + "/status\",";
-  sw += "\"payload_available\":\"ONLINE\",";
-  sw += "\"payload_not_available\":\"OFFLINE\",";
+  sw += "\"availability_topic\":\"" + prefix + "/availability\",";
+  sw += "\"payload_available\":\"Online\",";
+  sw += "\"payload_not_available\":\"Offline\",";
   sw += "\"device\":{";
   sw +=   "\"identifiers\":[\"" + devId + "\"],";
   sw +=   "\"name\":\"" + name + "\",";
@@ -293,6 +789,53 @@ void publishDiscovery()
     sw.c_str(), true);
   Serial.print("Discovery (switch): ");
   Serial.println(ok ? "OK" : "FAIL");
+}
+
+void publishLEDDiscovery()
+{
+  String name      = String(cfg.deviceName);
+  String room      = String(cfg.roomName);
+  String prefix    = String(cfg.mqttPrefix);
+  String devId     = "esp8266_" + String(cfg.mqttPrefix);
+
+  String lt;
+  lt  = "{";
+  lt += "\"name\":\"led\",";
+  lt += "\"object_id\":\"led\",";
+  lt += "\"unique_id\":\"" + devId + "_led\",";
+  lt += "\"schema\":\"json\",";
+  lt += "\"command_topic\":\"" + prefix + "/light/set\",";
+  lt += "\"state_topic\":\""   + prefix + "/light/state\",";
+  lt += "\"brightness\":true,";
+  lt += "\"color\":true,";
+  lt += "\"supported_color_modes\":[\"rgb\"],";
+  lt += "\"effect\":true,";
+  lt += "\"effect_list\":[";
+  for (int i = 0; i < EFFECT_COUNT; i++) {
+    lt += "\"" + String(LED_EFFECT_NAMES[i]) + "\"";
+    if (i < EFFECT_COUNT - 1) lt += ",";
+  }
+  lt += "],";
+  lt += "\"availability_topic\":\"" + prefix + "/availability\",";
+  lt += "\"payload_available\":\"Online\",";
+  lt += "\"payload_not_available\":\"Offline\",";
+  lt += "\"device\":{";
+  lt +=   "\"identifiers\":[\"" + devId + "\"],";
+  lt +=   "\"name\":\"" + name + "\",";
+  lt +=   "\"suggested_area\":\"" + room + "\",";
+  lt +=   "\"manufacturer\":\"DIY\",";
+  lt +=   "\"model\":\"ESP8266 WeMos D1\",";
+  lt +=   "\"sw_version\":\"" FW_VERSION "\"";
+  lt += "}}";
+
+  bool ok = client.publish(
+    ("homeassistant/light/" + devId + "_led/config").c_str(),
+    lt.c_str(), true);
+  Serial.print("Discovery (light): ");
+  Serial.println(ok ? "OK" : "FAIL");
+
+  publishSensorDiscovery("led_effect", "LED Effect", "led_effect", "", "", "mdi:palette");
+  publishSensorDiscovery("led_count", "LED Count", "led_count", "LEDs", "", "mdi:led-strip-variant");
 }
 
 void publishSensorDiscovery(
@@ -329,6 +872,7 @@ void publishSensorDiscovery(
 void publishAllDiscovery()
 {
   publishDiscovery();
+  publishLEDDiscovery();
   publishSensorDiscovery("wifi_signal", "WiFi Signal", "rssi",     "dBm",   "signal_strength", "");
   publishSensorDiscovery("ip_address",  "IP Address",  "ip",       "",      "",                "mdi:ip-network");
   publishSensorDiscovery("free_heap",   "Free Heap",   "heap",     "bytes", "",                "mdi:memory");
@@ -343,10 +887,16 @@ void callback(char* topic, byte* payload, unsigned int length)
 {
   String msg;
   for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
-  Serial.print("MQTT cmd: "); Serial.println(msg);
+  Serial.print("MQTT cmd on topic "); Serial.print(topic); Serial.print(": "); Serial.println(msg);
 
-  if (msg == "ON") updateRelay(true);
-  else             updateRelay(false);
+  String topicStr = String(topic);
+  if (topicStr.endsWith("/relay/set")) {
+    if (msg == "ON") updateRelay(true);
+    else             updateRelay(false);
+  }
+  else if (topicStr.endsWith("/light/set")) {
+    processLEDCommand(msg);
+  }
 }
 
 
@@ -361,21 +911,24 @@ void mqttReconnect()
 
   Serial.print("Connecting MQTT...");
 
-  String lwt = mqttTopic("status");
+  String lwt = mqttTopic("availability");
   String cmdTopic = mqttTopic("relay/set");
+  String ledCmdTopic = mqttTopic("light/set");
 
   if (client.connect(
         cfg.deviceName,          // client ID = device name
         cfg.mqttUser,
         cfg.mqttPass,
-        lwt.c_str(), 1, true, "OFFLINE"))
+        lwt.c_str(), 1, true, "Offline"))
   {
     Serial.println("Connected");
     client.subscribe(cmdTopic.c_str());
-    client.publish(lwt.c_str(), "ONLINE", true);
+    client.subscribe(ledCmdTopic.c_str());
+    client.publish(lwt.c_str(), "Online", false);
 
     publishAllDiscovery();
     publishRelayState();
+    publishLEDState();
     publishRSSI();
     publishIP();
     publishHeap();
@@ -492,7 +1045,7 @@ const char AP_SETUP_HTML[] PROGMEM = R"rawliteral(
     <div class="card">
       <div class="section-title">Device Settings</div>
       <div class="field"><label>Device Name <span style="opacity:.6;font-weight:400">(shown in Home Assistant)</span></label>
-        <input name="deviceName" placeholder="Living Room Fan" value="Fan Controller" required maxlength="32"/>
+        <input name="deviceName" placeholder="Bedroom" value="Bedroom" required maxlength="32"/>
       </div>
       <div class="field"><label>Room Name</label>
         <input name="roomName" placeholder="Living Room" maxlength="32"/>
@@ -745,6 +1298,46 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
   </div>
 </div>
 
+<div class="card status-card" id="led-card" style="display:none">
+  <div class="status-label">LED Light Status</div>
+  <span id="led-icon" class="fan-icon" style="color:var(--frost);transition:color .3s,filter .3s">&#x1F4A1;</span>
+  <div id="led-status" class="fan-status-text off">&#x2014;</div>
+  <div class="btn-row" style="margin-bottom:15px">
+    <button class="btn btn-on"  onclick="ledControl('ON')">&#x25B6; ON</button>
+    <button class="btn btn-off" onclick="ledControl('OFF')">&#x25A0; OFF</button>
+  </div>
+  <div style="text-align:left;display:flex;flex-direction:column;gap:12px;margin-top:10px">
+    <div>
+      <label style="font-size:.78rem;font-weight:500;color:var(--frost);opacity:.8;display:block;margin-bottom:4px">Brightness (<span id="lbl-led-brightness">128</span>)</label>
+      <input type="range" id="led-brightness" min="0" max="255" value="128" oninput="lblBrightness(this.value)" onchange="setBrightness(this.value)" style="width:100%;height:6px;background:rgba(0,180,216,.15);border-radius:3px;outline:none"/>
+    </div>
+    <div>
+      <label style="font-size:.78rem;font-weight:500;color:var(--frost);opacity:.8;display:block;margin-bottom:4px">Effect Speed (<span id="lbl-led-speed">128</span>)</label>
+      <input type="range" id="led-speed" min="0" max="255" value="128" oninput="lblSpeed(this.value)" onchange="setSpeed(this.value)" style="width:100%;height:6px;background:rgba(0,180,216,.15);border-radius:3px;outline:none"/>
+    </div>
+    <div style="display:flex;gap:10px;align-items:center">
+      <div style="flex:1">
+        <label style="font-size:.78rem;font-weight:500;color:var(--frost);opacity:.8;display:block;margin-bottom:4px">Effect</label>
+        <select id="led-effect" onchange="setEffect(this.value)" style="width:100%;padding:8px 10px;background:rgba(0,180,216,.07);border:1px solid rgba(144,224,239,.2);border-radius:10px;color:var(--light);font-family:'Inter',sans-serif;font-size:.9rem;outline:none">
+          <option value="Solid">Solid</option>
+          <option value="Rainbow">Rainbow</option>
+          <option value="Breathing">Breathing</option>
+          <option value="Color Wipe">Color Wipe</option>
+          <option value="Theater Chase">Theater Chase</option>
+          <option value="Fire">Fire</option>
+          <option value="Police">Police</option>
+          <option value="Ocean">Ocean</option>
+          <option value="Christmas">Christmas</option>
+        </select>
+      </div>
+      <div style="flex-shrink:0">
+        <label style="font-size:.78rem;font-weight:500;color:var(--frost);opacity:.8;display:block;margin-bottom:4px">Color</label>
+        <input type="color" id="led-color" onclick="activeColor=true" oninput="activeColor=true" onchange="setColor(this.value)" style="width:50px;height:38px;padding:2px;cursor:pointer;border-radius:10px;border:1px solid rgba(144,224,239,.2);background:none"/>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="stats-grid">
   <div class="stat-card">
     <span class="stat-icon">&#x1F4F6;</span>
@@ -783,6 +1376,8 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
 
 <script>
   var firstLoad = true;
+  var activeSlider = false;
+  var activeColor = false;
 
   function rssiQuality(dbm) {
     if (dbm >= -50) return {label:'Excellent', cls:'rssi-excellent'};
@@ -812,6 +1407,44 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
       fanEl.textContent='OFF'; fanEl.className='fan-status-text off';
       iconEl.className='fan-icon';
     }
+    
+    // LED State
+    if (d.ledEnabled) {
+      document.getElementById('led-card').style.display = 'block';
+      var ledStateEl = document.getElementById('led-status');
+      var ledIconEl = document.getElementById('led-icon');
+      if (d.ledState) {
+        ledStateEl.textContent = 'ON';
+        ledStateEl.className = 'fan-status-text on';
+        var colorStr = 'rgb(' + d.ledR + ',' + d.ledG + ',' + d.ledB + ')';
+        ledIconEl.style.color = colorStr;
+        ledIconEl.style.filter = 'drop-shadow(0 0 16px ' + colorStr + ')';
+      } else {
+        ledStateEl.textContent = 'OFF';
+        ledStateEl.className = 'fan-status-text off';
+        ledIconEl.style.color = 'var(--frost)';
+        ledIconEl.style.filter = 'none';
+      }
+      
+      if (!activeSlider && !activeColor) {
+        document.getElementById('led-brightness').value = d.ledBrightness;
+        document.getElementById('lbl-led-brightness').textContent = d.ledBrightness;
+        
+        document.getElementById('led-speed').value = d.ledSpeed;
+        document.getElementById('lbl-led-speed').textContent = d.ledSpeed;
+        
+        document.getElementById('led-effect').value = d.ledEffect;
+        
+        var hex = '#' + 
+          ('0' + (d.ledR || 0).toString(16)).slice(-2) + 
+          ('0' + (d.ledG || 0).toString(16)).slice(-2) + 
+          ('0' + (d.ledB || 0).toString(16)).slice(-2);
+        document.getElementById('led-color').value = hex;
+      }
+    } else {
+      document.getElementById('led-card').style.display = 'none';
+    }
+
     var q = rssiQuality(d.wifi);
     document.getElementById('stat-rssi').textContent = d.wifi+' dBm';
     var qEl = document.getElementById('stat-rssi-q');
@@ -836,6 +1469,61 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
   function fanControl(state) {
     fetch('/fan/'+state).then(function(r){return r.json();}).then(applyStatus).catch(function(){});
   }
+
+  function lblBrightness(v) {
+    document.getElementById('lbl-led-brightness').textContent = v;
+    activeSlider = true;
+  }
+  function setBrightness(v) {
+    activeSlider = false;
+    fetch('/led/brightness?value=' + encodeURIComponent(v), {method: 'POST', headers: {'Content-Type':'text/plain'}, body: v})
+      .then(function(r){return r.json();})
+      .then(applyStatus)
+      .catch(function(){});
+  }
+
+  function lblSpeed(v) {
+    document.getElementById('lbl-led-speed').textContent = v;
+    activeSlider = true;
+  }
+  function setSpeed(v) {
+    activeSlider = false;
+    fetch('/led/speed?value=' + encodeURIComponent(v), {method: 'POST', headers: {'Content-Type':'text/plain'}, body: v})
+      .then(function(r){return r.json();})
+      .then(applyStatus)
+      .catch(function(){});
+  }
+
+  function ledControl(state) {
+    fetch('/led/state?value=' + encodeURIComponent(state), {method: 'POST', headers: {'Content-Type':'text/plain'}, body: state})
+      .then(function(r){return r.json();})
+      .then(applyStatus)
+      .catch(function(){});
+  }
+
+  function setEffect(eff) {
+    fetch('/led/effect?value=' + encodeURIComponent(eff), {method: 'POST', headers: {'Content-Type':'text/plain'}, body: eff})
+      .then(function(r){return r.json();})
+      .then(applyStatus)
+      .catch(function(){});
+  }
+
+  function setColor(hex) {
+    activeColor = true;
+    fetch('/led/color?value=' + encodeURIComponent(hex), {method: 'POST', headers: {'Content-Type':'text/plain'}, body: hex})
+      .then(function(r){return r.json();})
+      .then(function(d) {
+        activeColor = false;
+        applyStatus(d);
+      })
+      .catch(function(){
+        activeColor = false;
+      });
+  }
+
+  document.getElementById('led-color').addEventListener('blur', function() {
+    setTimeout(function() { activeColor = false; }, 1000);
+  });
 
   function tickClock() {
     var now = new Date();
@@ -1056,6 +1744,45 @@ const char SETTINGS_HTML[] PROGMEM = R"rawliteral(
     </div>
   </div>
 
+  <div class="card">
+    <div class="section-title">LED Strip Settings</div>
+    <div class="field">
+      <label style="display:inline-flex;align-items:center;gap:10px;cursor:pointer">
+        <input type="checkbox" id="ledEnabled" name="ledEnabled" style="width:auto;margin:0" value="1"/> Enable LED Strip
+      </label>
+    </div>
+    <div class="field">
+      <label>Number of LEDs</label>
+      <input type="number" id="ledCount" name="ledCount" min="1" max="300" value="45"/>
+    </div>
+    <div class="field">
+      <label>Default Brightness (0-255)</label>
+      <input type="range" id="ledDefaultBrightness" name="ledDefaultBrightness" min="0" max="255" style="padding:0"/>
+    </div>
+    <div class="field">
+      <label>Default Effect</label>
+      <select id="ledDefaultEffect" name="ledDefaultEffect" style="width:100%;padding:11px 14px;background:rgba(0,180,216,.07);border:1px solid rgba(144,224,239,.2);border-radius:10px;color:var(--light);font-family:'Inter',sans-serif;font-size:.9rem;outline:none">
+        <option value="0">Solid</option>
+        <option value="1">Rainbow</option>
+        <option value="2">Breathing</option>
+        <option value="3">Color Wipe</option>
+        <option value="4">Theater Chase</option>
+        <option value="5">Fire</option>
+        <option value="6">Police</option>
+        <option value="7">Ocean</option>
+        <option value="8">Christmas</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>Default Effect Speed (0-255)</label>
+      <input type="range" id="ledDefaultSpeed" name="ledDefaultSpeed" min="0" max="255" style="padding:0"/>
+    </div>
+    <div class="field">
+      <label>Default Color</label>
+      <input type="color" id="ledDefaultColor" style="height:44px;padding:3px;cursor:pointer;border-radius:10px;border:1px solid rgba(144,224,239,.2);background:none"/>
+    </div>
+  </div>
+
   <div class="action-bar">
     <button type="submit" class="btn btn-save">&#x1F4BE; Save Settings</button>
     <button type="button" class="btn btn-restart" onclick="doRestart()">&#x1F504; Restart ESP</button>
@@ -1106,6 +1833,18 @@ const char SETTINGS_HTML[] PROGMEM = R"rawliteral(
       document.getElementById('otaPass').value     = d.otaPass     || '';
       document.getElementById('deviceName').value  = d.deviceName  || '';
       document.getElementById('roomName').value    = d.roomName    || '';
+      
+      document.getElementById('ledEnabled').checked = !!d.ledEnabled;
+      document.getElementById('ledCount').value    = d.ledCount    || 45;
+      document.getElementById('ledDefaultBrightness').value = d.ledDefaultBrightness !== undefined ? d.ledDefaultBrightness : 128;
+      document.getElementById('ledDefaultEffect').value = d.ledDefaultEffect || 0;
+      document.getElementById('ledDefaultSpeed').value = d.ledDefaultSpeed !== undefined ? d.ledDefaultSpeed : 128;
+      
+      var hex = '#' + 
+        ('0' + (d.ledDefaultR || 0).toString(16)).slice(-2) + 
+        ('0' + (d.ledDefaultG || 0).toString(16)).slice(-2) + 
+        ('0' + (d.ledDefaultB || 0).toString(16)).slice(-2);
+      document.getElementById('ledDefaultColor').value = hex;
     })
     .catch(function(){ showToast('Could not load settings', 'toast-err'); });
 
@@ -1113,6 +1852,12 @@ const char SETTINGS_HTML[] PROGMEM = R"rawliteral(
     e.preventDefault();
     var btn = this.querySelector('.btn-save');
     btn.disabled = true; btn.textContent = 'Saving...';
+    
+    var colorHex = document.getElementById('ledDefaultColor').value;
+    var r = parseInt(colorHex.slice(1,3), 16);
+    var g = parseInt(colorHex.slice(3,5), 16);
+    var b = parseInt(colorHex.slice(5,7), 16);
+
     var data = {
       wifiSSID:   document.getElementById('wifiSSID').value.trim(),
       wifiPass:   document.getElementById('wifiPass').value,
@@ -1123,7 +1868,16 @@ const char SETTINGS_HTML[] PROGMEM = R"rawliteral(
       mqttPrefix: document.getElementById('mqttPrefix').value.trim(),
       otaPass:    document.getElementById('otaPass').value,
       deviceName: document.getElementById('deviceName').value.trim(),
-      roomName:   document.getElementById('roomName').value.trim()
+      roomName:   document.getElementById('roomName').value.trim(),
+      
+      ledEnabled:            document.getElementById('ledEnabled').checked,
+      ledCount:              parseInt(document.getElementById('ledCount').value) || 45,
+      ledDefaultBrightness:  parseInt(document.getElementById('ledDefaultBrightness').value) || 128,
+      ledDefaultEffect:      parseInt(document.getElementById('ledDefaultEffect').value) || 0,
+      ledDefaultSpeed:       parseInt(document.getElementById('ledDefaultSpeed').value) || 128,
+      ledDefaultR:           r,
+      ledDefaultG:           g,
+      ledDefaultB:           b
     };
     if (!data.wifiSSID)   { showToast('WiFi SSID is required',   'toast-err'); btn.disabled=false; btn.textContent='Save Settings'; return; }
     if (!data.mqttServer) { showToast('MQTT Server is required',  'toast-err'); btn.disabled=false; btn.textContent='Save Settings'; return; }
@@ -1183,7 +1937,15 @@ String buildStatusJSON()
   json += "\"mqtt\":"       + String(client.connected() ? "true" : "false") + ",";
   json += "\"uptime\":\""   + String(uptime)                        + "\",";
   json += "\"firmware\":\"" FW_VERSION "\",";
-  json += "\"device\":\""   + String(cfg.deviceName)               + "\"";
+  json += "\"device\":\""   + String(cfg.deviceName)               + "\",";
+  json += "\"ledEnabled\":" + String(cfg.ledEnabled ? "true" : "false") + ",";
+  json += "\"ledState\":"   + String(cfg.ledState ? "true" : "false") + ",";
+  json += "\"ledBrightness\":" + String(cfg.ledBrightness) + ",";
+  json += "\"ledEffect\":\"" + getEffectName(cfg.ledEffect) + "\",";
+  json += "\"ledSpeed\":"   + String(cfg.ledSpeed) + ",";
+  json += "\"ledR\":"       + String(cfg.ledR) + ",";
+  json += "\"ledG\":"       + String(cfg.ledG) + ",";
+  json += "\"ledB\":"       + String(cfg.ledB);
   json += "}";
   return json;
 }
@@ -1216,12 +1978,161 @@ void handleEvents()
   ssePush();
 }
 
+// LED REST Handlers
+void handleLedStatus()
+{
+  if (!cfg.ledEnabled) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"LED strip is disabled\"}");
+    return;
+  }
+  server.send(200, "application/json", buildStatusJSON());
+}
+
+void handleLedState()
+{
+  if (!cfg.ledEnabled) { server.send(400, "application/json", "{\"ok\":false}"); return; }
+  String body = "";
+  if (server.hasArg("value")) body = server.arg("value");
+  else if (server.hasArg("plain")) body = server.arg("plain");
+  else if (server.args() > 0) body = server.arg(0);
+
+  if (body.length() > 0) {
+    body.trim();
+    if (body == "ON") {
+      cfg.ledState = true;
+    } else if (body == "OFF") {
+      cfg.ledState = false;
+    } else {
+      server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid state\"}");
+      return;
+    }
+    updateLED();
+    publishLEDState();
+    server.send(200, "application/json", buildStatusJSON());
+  } else {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"No argument\"}");
+  }
+}
+
+void handleLedColor()
+{
+  if (!cfg.ledEnabled) { server.send(400, "application/json", "{\"ok\":false}"); return; }
+  String body = "";
+  if (server.hasArg("value")) body = server.arg("value");
+  else if (server.hasArg("plain")) body = server.arg("plain");
+  else if (server.args() > 0) body = server.arg(0);
+
+  if (body.length() > 0) {
+    body.trim();
+    
+    uint8_t r = 255, g = 255, b = 255;
+    bool parsed = false;
+    
+    if (body.startsWith("#") || body.startsWith("%23")) {
+      String hex = body.startsWith("#") ? body.substring(1) : body.substring(3);
+      long number = parseHex(hex);
+      r = (number >> 16) & 0xFF;
+      g = (number >> 8) & 0xFF;
+      b = number & 0xFF;
+      parsed = true;
+    } else if (body.length() == 6) {
+      long number = parseHex(body);
+      r = (number >> 16) & 0xFF;
+      g = (number >> 8) & 0xFF;
+      b = number & 0xFF;
+      parsed = true;
+    } else {
+      int firstComma = body.indexOf(',');
+      int secondComma = body.indexOf(',', firstComma + 1);
+      if (firstComma > 0 && secondComma > firstComma) {
+        r = body.substring(0, firstComma).toInt();
+        g = body.substring(firstComma + 1, secondComma).toInt();
+        b = body.substring(secondComma + 1).toInt();
+        parsed = true;
+      }
+    }
+    
+    if (parsed) {
+      setLEDColor(r, g, b);
+      publishLEDState();
+      server.send(200, "application/json", buildStatusJSON());
+    } else {
+      server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid format\"}");
+    }
+  } else {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"No argument\"}");
+  }
+}
+
+void handleLedBrightness()
+{
+  if (!cfg.ledEnabled) { server.send(400, "application/json", "{\"ok\":false}"); return; }
+  String body = "";
+  if (server.hasArg("value")) body = server.arg("value");
+  else if (server.hasArg("plain")) body = server.arg("plain");
+  else if (server.args() > 0) body = server.arg(0);
+
+  if (body.length() > 0) {
+    body.trim();
+    int bVal = body.toInt();
+    if (bVal >= 0 && bVal <= 255) {
+      cfg.ledBrightness = bVal;
+      updateLED();
+      publishLEDState();
+      server.send(200, "application/json", buildStatusJSON());
+    } else {
+      server.send(400, "application/json", "{\"ok\":false,\"error\":\"Out of range 0-255\"}");
+    }
+  } else {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"No argument\"}");
+  }
+}
+
+void handleLedEffect()
+{
+  if (!cfg.ledEnabled) { server.send(400, "application/json", "{\"ok\":false}"); return; }
+  String body = "";
+  if (server.hasArg("value")) body = server.arg("value");
+  else if (server.hasArg("plain")) body = server.arg("plain");
+  else if (server.args() > 0) body = server.arg(0);
+
+  if (body.length() > 0) {
+    body.trim();
+    setLEDEffect(body);
+    publishLEDState();
+    server.send(200, "application/json", buildStatusJSON());
+  } else {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"No argument\"}");
+  }
+}
+
+void handleLedSpeed()
+{
+  if (!cfg.ledEnabled) { server.send(400, "application/json", "{\"ok\":false}"); return; }
+  String body = "";
+  if (server.hasArg("value")) body = server.arg("value");
+  else if (server.hasArg("plain")) body = server.arg("plain");
+  else if (server.args() > 0) body = server.arg(0);
+
+  if (body.length() > 0) {
+    body.trim();
+    int sVal = body.toInt();
+    if (sVal >= 0 && sVal <= 255) {
+      cfg.ledSpeed = sVal;
+      updateLED();
+      publishLEDState();
+      server.send(200, "application/json", buildStatusJSON());
+    } else {
+      server.send(400, "application/json", "{\"ok\":false,\"error\":\"Out of range 0-255\"}");
+    }
+  } else {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"No argument\"}");
+  }
+}
+
 // GET /api/settings  – return current config (passwords masked)
 void handleApiSettingsGet()
 {
-  // Passwords are always returned as "********" for security.
-  // The settings page JS sends "********" back unchanged;
-  // handleApiSettingsPost() skips overwriting those fields.
   String json = "{";
   json += "\"wifiSSID\":\""   + String(cfg.wifiSSID)   + "\",";
   json += "\"wifiPass\":\""   + String(MASK)            + "\",";
@@ -1232,7 +2143,16 @@ void handleApiSettingsGet()
   json += "\"mqttPrefix\":\"" + String(cfg.mqttPrefix) + "\",";
   json += "\"otaPass\":\""    + String(MASK)            + "\",";
   json += "\"deviceName\":\"" + String(cfg.deviceName) + "\",";
-  json += "\"roomName\":\""   + String(cfg.roomName)   + "\"";
+  json += "\"roomName\":\""   + String(cfg.roomName)   + "\",";
+  // LED parameters
+  json += "\"ledEnabled\":"   + String(cfg.ledEnabled ? "true" : "false") + ",";
+  json += "\"ledCount\":"      + String(cfg.ledCount)   + ",";
+  json += "\"ledDefaultBrightness\":" + String(cfg.ledDefaultBrightness) + ",";
+  json += "\"ledDefaultEffect\":" + String(cfg.ledDefaultEffect) + ",";
+  json += "\"ledDefaultR\":"  + String(cfg.ledDefaultR) + ",";
+  json += "\"ledDefaultG\":"  + String(cfg.ledDefaultG) + ",";
+  json += "\"ledDefaultB\":"  + String(cfg.ledDefaultB) + ",";
+  json += "\"ledDefaultSpeed\":" + String(cfg.ledDefaultSpeed);
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -1288,6 +2208,35 @@ void handleApiSettingsPost()
   int port = jsonInt(body, "mqttPort");
   if (port > 0 && port <= 65535) cfg.mqttPort = (uint16_t)port;
 
+  // LED Settings
+  if (body.indexOf("\"ledEnabled\":true") >= 0 || body.indexOf("\"ledEnabled\": true") >= 0) {
+    cfg.ledEnabled = true;
+  } else if (body.indexOf("\"ledEnabled\":false") >= 0 || body.indexOf("\"ledEnabled\": false") >= 0) {
+    cfg.ledEnabled = false;
+  } else {
+    int ledEnabled = jsonInt(body, "ledEnabled");
+    if (ledEnabled >= 0) cfg.ledEnabled = (ledEnabled == 1);
+  }
+
+  int ledCount = jsonInt(body, "ledCount");
+  if (ledCount > 0 && ledCount <= MAX_LEDS) cfg.ledCount = ledCount;
+
+  int db = jsonInt(body, "ledDefaultBrightness");
+  if (db >= 0 && db <= 255) cfg.ledDefaultBrightness = db;
+
+  int de = jsonInt(body, "ledDefaultEffect");
+  if (de >= 0 && de < EFFECT_COUNT) cfg.ledDefaultEffect = de;
+
+  int dr = jsonInt(body, "ledDefaultR");
+  if (dr >= 0 && dr <= 255) cfg.ledDefaultR = dr;
+  int dg = jsonInt(body, "ledDefaultG");
+  if (dg >= 0 && dg <= 255) cfg.ledDefaultG = dg;
+  int db_col = jsonInt(body, "ledDefaultB");
+  if (db_col >= 0 && db_col <= 255) cfg.ledDefaultB = db_col;
+
+  int ds = jsonInt(body, "ledDefaultSpeed");
+  if (ds >= 0 && ds <= 255) cfg.ledDefaultSpeed = ds;
+
   // ── Only overwrite passwords if not the mask sentinel ────
   String wifiPass = jsonStr(body, "wifiPass");
   if (wifiPass != MASK && !wifiPass.isEmpty())
@@ -1302,6 +2251,14 @@ void handleApiSettingsPost()
     strlcpy(cfg.otaPass, otaPass.c_str(), sizeof(cfg.otaPass));
 
   saveConfig();
+
+  // Restart/setup the LED driver dynamically
+  if (cfg.ledEnabled) {
+    setupLED();
+  } else {
+    FastLED.clear();
+    FastLED.show();
+  }
 
   server.send(200, "application/json", "{\"ok\":true}");
   Serial.println("Settings saved – restarting");
@@ -1358,6 +2315,24 @@ void handleApSave()
   int port = jsonInt(body, "mqttPort");
   cfg.mqttPort = (port > 0 && port <= 65535) ? (uint16_t)port : 1883;
 
+  cfg.configVersion = 2;
+  cfg.ledEnabled = true;
+  cfg.ledCount = 45;
+  cfg.ledDefaultBrightness = 128;
+  cfg.ledDefaultEffect = EFFECT_SOLID;
+  cfg.ledDefaultR = 255;
+  cfg.ledDefaultG = 255;
+  cfg.ledDefaultB = 255;
+  cfg.ledDefaultSpeed = 128;
+
+  cfg.ledState = false;
+  cfg.ledBrightness = 128;
+  cfg.ledEffect = EFFECT_SOLID;
+  cfg.ledR = 255;
+  cfg.ledG = 255;
+  cfg.ledB = 255;
+  cfg.ledSpeed = 128;
+
   saveConfig();
   server.send(200, "application/json", "{\"ok\":true}");
   Serial.println("Initial config saved – restarting");
@@ -1392,6 +2367,24 @@ void setup()
     Serial.println("No config found – starting AP setup mode");
     normalMode = false;
 
+    cfg.configVersion = 2;
+    cfg.ledEnabled = false;
+    cfg.ledCount = 45;
+    cfg.ledDefaultBrightness = 128;
+    cfg.ledDefaultEffect = EFFECT_SOLID;
+    cfg.ledDefaultR = 255;
+    cfg.ledDefaultG = 255;
+    cfg.ledDefaultB = 255;
+    cfg.ledDefaultSpeed = 128;
+
+    cfg.ledState = false;
+    cfg.ledBrightness = 128;
+    cfg.ledEffect = EFFECT_SOLID;
+    cfg.ledR = 255;
+    cfg.ledG = 255;
+    cfg.ledB = 255;
+    cfg.ledSpeed = 128;
+
     WiFi.mode(WIFI_AP);
     char apSSID[32];
     snprintf(apSSID, sizeof(apSSID), "ESP8266-%04X", ESP.getChipId() & 0xFFFF);
@@ -1415,6 +2408,12 @@ void setup()
   Serial.print("Device: "); Serial.println(cfg.deviceName);
   Serial.print("Room:   "); Serial.println(cfg.roomName);
   Serial.print("Prefix: "); Serial.println(cfg.mqttPrefix);
+
+  if (cfg.ledEnabled) {
+    setupLED();
+    targetLedBrightness = cfg.ledState ? cfg.ledBrightness : 0;
+    currentLedBrightness = 0; // Fade up at boot
+  }
 
   // ── WIFI ───────────────────────────────────────────────────
   WiFi.mode(WIFI_STA);
@@ -1473,6 +2472,12 @@ void setup()
   server.on("/fan/on",      HTTP_GET,  handleFanOn);
   server.on("/fan/off",     HTTP_GET,  handleFanOff);
   server.on("/events",      HTTP_GET,  handleEvents);
+  server.on("/led/status",      HTTP_GET,  handleLedStatus);
+  server.on("/led/state",       HTTP_POST, handleLedState);
+  server.on("/led/color",       HTTP_POST, handleLedColor);
+  server.on("/led/brightness",  HTTP_POST, handleLedBrightness);
+  server.on("/led/effect",      HTTP_POST, handleLedEffect);
+  server.on("/led/speed",       HTTP_POST, handleLedSpeed);
   server.on("/api/settings",HTTP_GET,  handleApiSettingsGet);
   server.on("/api/settings",HTTP_POST, handleApiSettingsPost);
   server.on("/api/restart", HTTP_POST, handleRestart);
@@ -1524,6 +2529,16 @@ void loop()
   }
 
   // ── NORMAL MODE ────────────────────────────────────────────
+
+  // Run LED effects
+  runLEDEffects();
+
+  // EEPROM Auto-Save Debounce
+  if (ledStateNeedsSaving && (millis() - lastLedStateChangeTime >= 5000)) {
+    ledStateNeedsSaving = false;
+    saveConfig();
+    Serial.println("LED state auto-saved to EEPROM.");
+  }
 
   // MQTT (non-blocking reconnect)
   if (!client.connected()) mqttReconnect();
