@@ -1,0 +1,27 @@
+# Environment variables (contains private credentials)
+.env
+.env.local
+.env.*.local
+
+# Python virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE configurations
+.vscode/
+.idea/
+
+# Application logs
+*.log
+HumanDetection/app.log
+
+# Camera captures/screenshots (if enabled)
+HumanDetection/captures/
+captures/
