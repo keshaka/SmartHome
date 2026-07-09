@@ -248,6 +248,11 @@ ESP8266WebServer server(80);
 // Flag set in setup() – true = normal mode, false = AP setup mode
 bool normalMode = false;
 
+// WiFi Disconnection LED Alert State
+bool wifiFirstConnected = false;
+bool wifiDisconnectLedActive = false;
+unsigned long wifiDisconnectTime = 0;
+
 // FastLED definitions
 #define MAX_LEDS 300
 CRGB leds[MAX_LEDS];
@@ -2702,6 +2707,64 @@ void loop()
   }
 
   // ── NORMAL MODE ────────────────────────────────────────────
+
+  // WiFi Disconnection LED Alert Monitoring
+  static bool lastWifiConnectedState = false;
+  bool currentWifiConnectedState = (WiFi.status() == WL_CONNECTED);
+
+  if (currentWifiConnectedState && !wifiFirstConnected) {
+    wifiFirstConnected = true;
+    lastWifiConnectedState = true;
+    Serial.println("WiFi: Initial connection successful.");
+  }
+
+  if (wifiFirstConnected) {
+    if (lastWifiConnectedState && !currentWifiConnectedState) {
+      // WiFi just disconnected!
+      lastWifiConnectedState = false;
+      Serial.println("WiFi: Disconnected! Starting LED alert...");
+      
+      // Trigger Red Alert if LED is configured
+      if (cfg.ledEnabled) {
+        cfg.ledState = true;
+        cfg.ledR = 255;
+        cfg.ledG = 0;
+        cfg.ledB = 0;
+        cfg.ledBrightness = 128; // 50% brightness
+        cfg.ledEffect = EFFECT_SOLID;
+        updateLED();
+        publishLEDState();
+        
+        wifiDisconnectLedActive = true;
+        wifiDisconnectTime = millis();
+      }
+    } 
+    else if (!lastWifiConnectedState && currentWifiConnectedState) {
+      // WiFi just reconnected!
+      lastWifiConnectedState = true;
+      Serial.println("WiFi: Reconnected! Stopping LED alert...");
+      
+      if (wifiDisconnectLedActive) {
+        wifiDisconnectLedActive = false;
+        if (cfg.ledEnabled) {
+          cfg.ledState = false;
+          updateLED();
+          publishLEDState();
+        }
+      }
+    }
+
+    // Auto-off after 5 minutes (300000ms)
+    if (wifiDisconnectLedActive && (millis() - wifiDisconnectTime >= 300000)) {
+      Serial.println("WiFi: Disconnection LED alert timed out after 5 minutes.");
+      wifiDisconnectLedActive = false;
+      if (cfg.ledEnabled) {
+        cfg.ledState = false;
+        updateLED();
+        publishLEDState();
+      }
+    }
+  }
 
   // Run LED effects
   runLEDEffects();
