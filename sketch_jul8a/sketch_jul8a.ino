@@ -30,6 +30,7 @@
 #include <ESP8266WebServer.h>
 #include <EEPROM.h>
 #include <ESP8266mDNS.h>
+#include <WiFiUdp.h>
 #define FASTLED_INTERNAL
 #include <FastLED.h>
 
@@ -107,7 +108,10 @@ struct Config {
   uint8_t  ledG;
   uint8_t  ledB;
   uint8_t  ledSpeed;
-};                           // Total: ≈ 414 bytes  (well within 512)
+
+  // -- PC Wake on LAN Settings (v3) --
+  char     pcMac[18];        // PC MAC Address (max 17 chars + \0)
+};                           // Total: ≈ 432 bytes  (well within 512)
 
 Config cfg;                  // active configuration in RAM
 
@@ -122,25 +126,33 @@ void loadConfig()
 
   // If valid magic but older version, migrate settings
   if (cfg.magic == CONFIG_MAGIC) {
-    if (cfg.configVersion != 2) {
-      Serial.println("Migrating configuration to version 2...");
-      cfg.configVersion = 2;
-      cfg.ledEnabled = true;
-      cfg.ledCount = 45; // default count 45 (static)
-      cfg.ledDefaultBrightness = 128;
-      cfg.ledDefaultEffect = EFFECT_SOLID;
-      cfg.ledDefaultR = 255;
-      cfg.ledDefaultG = 255;
-      cfg.ledDefaultB = 255;
-      cfg.ledDefaultSpeed = 128;
+    if (cfg.configVersion < 3) {
+      Serial.print("Migrating configuration from version ");
+      Serial.print(cfg.configVersion);
+      Serial.println(" to version 3...");
 
-      cfg.ledState = false;
-      cfg.ledBrightness = 128;
-      cfg.ledEffect = EFFECT_SOLID;
-      cfg.ledR = 255;
-      cfg.ledG = 255;
-      cfg.ledB = 255;
-      cfg.ledSpeed = 128;
+      if (cfg.configVersion < 2) {
+        cfg.ledEnabled = true;
+        cfg.ledCount = 45; // default count 45 (static)
+        cfg.ledDefaultBrightness = 128;
+        cfg.ledDefaultEffect = EFFECT_SOLID;
+        cfg.ledDefaultR = 255;
+        cfg.ledDefaultG = 255;
+        cfg.ledDefaultB = 255;
+        cfg.ledDefaultSpeed = 128;
+
+        cfg.ledState = false;
+        cfg.ledBrightness = 128;
+        cfg.ledEffect = EFFECT_SOLID;
+        cfg.ledR = 255;
+        cfg.ledG = 255;
+        cfg.ledB = 255;
+        cfg.ledSpeed = 128;
+      }
+
+      // version 3 additions
+      cfg.configVersion = 3;
+      memset(cfg.pcMac, 0, sizeof(cfg.pcMac));
 
       saveConfig();
       Serial.println("Configuration migrated successfully.");
@@ -152,11 +164,46 @@ void loadConfig()
 void saveConfig()
 {
   cfg.magic = CONFIG_MAGIC;
-  cfg.configVersion = 2;
+  cfg.configVersion = 3;
   EEPROM.begin(EEPROM_SIZE);
   EEPROM.put(0, cfg);
   EEPROM.commit();
   EEPROM.end();
+}
+
+// Send Wake on LAN Magic Packet
+void sendWOL(const char* macStr)
+{
+  byte mac[6];
+  int values[6];
+  if (sscanf(macStr, "%x:%x:%x:%x:%x:%x", &values[0], &values[1], &values[2], &values[3], &values[4], &values[5]) == 6 ||
+      sscanf(macStr, "%x-%x-%x-%x-%x-%x", &values[0], &values[1], &values[2], &values[3], &values[4], &values[5]) == 6) {
+    for (int i = 0; i < 6; ++i) {
+      mac[i] = (byte)values[i];
+    }
+  } else {
+    Serial.println("WOL: Invalid MAC address format");
+    return;
+  }
+
+  byte packet[102];
+  // First 6 bytes are 0xFF
+  for (int i = 0; i < 6; i++) {
+    packet[i] = 0xFF;
+  }
+  // Next 16 blocks of 6 bytes are the MAC address
+  for (int i = 1; i <= 16; i++) {
+    memcpy(&packet[i * 6], mac, 6);
+  }
+
+  WiFiUDP udp;
+  udp.begin(9);
+  udp.beginPacket(IPAddress(255, 255, 255, 255), 9);
+  udp.write(packet, sizeof(packet));
+  udp.endPacket();
+  udp.stop();
+  Serial.print("WOL Magic Packet sent to MAC: ");
+  Serial.println(macStr);
 }
 
 // Wipe EEPROM and restart into AP mode
@@ -268,7 +315,8 @@ void ssePush()
   json += "\"ledSpeed\":"   + String(cfg.ledSpeed) + ",";
   json += "\"ledR\":"       + String(cfg.ledR) + ",";
   json += "\"ledG\":"       + String(cfg.ledG) + ",";
-  json += "\"ledB\":"       + String(cfg.ledB);
+  json += "\"ledB\":"       + String(cfg.ledB) + ",";
+  json += "\"pcMac\":\""    + String(cfg.pcMac)                     + "\"";
   json += "}";
 
   sseClient.print("data: ");
@@ -869,10 +917,42 @@ void publishSensorDiscovery(
   client.publish(topic.c_str(), p.c_str(), true);
 }
 
+void publishWOLDiscovery()
+{
+  String name      = String(cfg.deviceName);
+  String room      = String(cfg.roomName);
+  String prefix    = String(cfg.mqttPrefix);
+  String devId     = "esp8266_" + String(cfg.mqttPrefix);
+
+  String b;
+  b  = "{";
+  b += "\"name\":\"Wake PC\",";
+  b += "\"object_id\":\"wake_pc\",";
+  b += "\"unique_id\":\"" + devId + "_wake_pc\",";
+  b += "\"command_topic\":\"" + prefix + "/pc/wake\",";
+  b += "\"payload_press\":\"WAKE\",";
+  b += "\"availability_topic\":\"" + prefix + "/availability\",";
+  b += "\"payload_available\":\"Online\",";
+  b += "\"payload_not_available\":\"Offline\",";
+  b += "\"icon\":\"mdi:lan-connect\",";
+  b += "\"device\":{";
+  b +=   "\"identifiers\":[\"" + devId + "\"],";
+  b +=   "\"name\":\"" + name + "\",";
+  b +=   "\"suggested_area\":\"" + room + "\",";
+  b +=   "\"manufacturer\":\"DIY\",";
+  b +=   "\"model\":\"ESP8266 WeMos D1\",";
+  b +=   "\"sw_version\":\"" FW_VERSION "\"";
+  b += "}}";
+
+  String topic = "homeassistant/button/" + devId + "_wake_pc/config";
+  client.publish(topic.c_str(), b.c_str(), true);
+}
+
 void publishAllDiscovery()
 {
   publishDiscovery();
   publishLEDDiscovery();
+  publishWOLDiscovery();
   publishSensorDiscovery("wifi_signal", "WiFi Signal", "rssi",     "dBm",   "signal_strength", "");
   publishSensorDiscovery("ip_address",  "IP Address",  "ip",       "",      "",                "mdi:ip-network");
   publishSensorDiscovery("free_heap",   "Free Heap",   "heap",     "bytes", "",                "mdi:memory");
@@ -897,6 +977,11 @@ void callback(char* topic, byte* payload, unsigned int length)
   else if (topicStr.endsWith("/light/set")) {
     processLEDCommand(msg);
   }
+  else if (topicStr.endsWith("/pc/wake")) {
+    if (msg == "WAKE" && strlen(cfg.pcMac) > 0) {
+      sendWOL(cfg.pcMac);
+    }
+  }
 }
 
 
@@ -914,6 +999,7 @@ void mqttReconnect()
   String lwt = mqttTopic("availability");
   String cmdTopic = mqttTopic("relay/set");
   String ledCmdTopic = mqttTopic("light/set");
+  String pcWakeTopic = mqttTopic("pc/wake");
 
   if (client.connect(
         cfg.deviceName,          // client ID = device name
@@ -924,6 +1010,7 @@ void mqttReconnect()
     Serial.println("Connected");
     client.subscribe(cmdTopic.c_str());
     client.subscribe(ledCmdTopic.c_str());
+    client.subscribe(pcWakeTopic.c_str());
     client.publish(lwt.c_str(), "Online", false);
 
     publishAllDiscovery();
@@ -1338,6 +1425,15 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
   </div>
 </div>
 
+<div class="card status-card" id="wol-card">
+  <div class="status-label">PC Wake on LAN</div>
+  <span class="fan-icon" style="color:var(--frost);">&#x1F5A5;&#xFE0F;</span>
+  <div id="wol-status" class="fan-status-text off" style="color:var(--frost); font-size:1.15rem; text-shadow:none; font-weight:500; margin-bottom:12px;">Not Configured</div>
+  <div class="btn-row">
+    <button class="btn btn-on" id="btn-wake" onclick="wakePC()" style="background:linear-gradient(135deg, var(--primary), var(--accent)); color:#03045e;">&#x26A1; Wake PC</button>
+  </div>
+</div>
+
 <div class="stats-grid">
   <div class="stat-card">
     <span class="stat-icon">&#x1F4F6;</span>
@@ -1445,6 +1541,21 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
       document.getElementById('led-card').style.display = 'none';
     }
 
+    // WOL State
+    var wolStatusEl = document.getElementById('wol-status');
+    var btnWakeEl = document.getElementById('btn-wake');
+    if (d.pcMac && d.pcMac.trim().length > 0) {
+      wolStatusEl.textContent = 'MAC: ' + d.pcMac;
+      btnWakeEl.disabled = false;
+      btnWakeEl.style.opacity = '1';
+      btnWakeEl.style.cursor = 'pointer';
+    } else {
+      wolStatusEl.textContent = 'Not Configured';
+      btnWakeEl.disabled = true;
+      btnWakeEl.style.opacity = '0.5';
+      btnWakeEl.style.cursor = 'not-allowed';
+    }
+
     var q = rssiQuality(d.wifi);
     document.getElementById('stat-rssi').textContent = d.wifi+' dBm';
     var qEl = document.getElementById('stat-rssi-q');
@@ -1524,6 +1635,35 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
   document.getElementById('led-color').addEventListener('blur', function() {
     setTimeout(function() { activeColor = false; }, 1000);
   });
+
+  function wakePC() {
+    var btn = document.getElementById('btn-wake');
+    var originalText = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '&#x1F4E1; Sending...';
+    fetch('/api/pc/wake', {method: 'POST'})
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        if (d.ok) {
+          btn.innerHTML = '&#x2705; Sent!';
+          setTimeout(function() {
+            btn.innerHTML = originalText;
+            btn.disabled = false;
+          }, 3000);
+        } else {
+          alert('Error: ' + (d.error || 'unknown'));
+          btn.innerHTML = originalText;
+          btn.disabled = false;
+        }
+      })
+      .catch(function() {
+        btn.innerHTML = '&#x274C; Failed';
+        setTimeout(function() {
+          btn.innerHTML = originalText;
+          btn.disabled = false;
+        }, 3000);
+      });
+  }
 
   function tickClock() {
     var now = new Date();
@@ -1783,6 +1923,14 @@ const char SETTINGS_HTML[] PROGMEM = R"rawliteral(
     </div>
   </div>
 
+  <div class="card">
+    <div class="section-title">PC Wake on LAN Settings</div>
+    <div class="field">
+      <label>PC MAC Address</label>
+      <input id="pcMac" name="pcMac" placeholder="AA:BB:CC:DD:EE:FF" maxlength="17"/>
+    </div>
+  </div>
+
   <div class="action-bar">
     <button type="submit" class="btn btn-save">&#x1F4BE; Save Settings</button>
     <button type="button" class="btn btn-restart" onclick="doRestart()">&#x1F504; Restart ESP</button>
@@ -1833,6 +1981,7 @@ const char SETTINGS_HTML[] PROGMEM = R"rawliteral(
       document.getElementById('otaPass').value     = d.otaPass     || '';
       document.getElementById('deviceName').value  = d.deviceName  || '';
       document.getElementById('roomName').value    = d.roomName    || '';
+      document.getElementById('pcMac').value       = d.pcMac       || '';
       
       document.getElementById('ledEnabled').checked = !!d.ledEnabled;
       document.getElementById('ledCount').value    = d.ledCount    || 45;
@@ -1869,6 +2018,7 @@ const char SETTINGS_HTML[] PROGMEM = R"rawliteral(
       otaPass:    document.getElementById('otaPass').value,
       deviceName: document.getElementById('deviceName').value.trim(),
       roomName:   document.getElementById('roomName').value.trim(),
+      pcMac:      document.getElementById('pcMac').value.trim(),
       
       ledEnabled:            document.getElementById('ledEnabled').checked,
       ledCount:              parseInt(document.getElementById('ledCount').value) || 45,
@@ -1945,7 +2095,8 @@ String buildStatusJSON()
   json += "\"ledSpeed\":"   + String(cfg.ledSpeed) + ",";
   json += "\"ledR\":"       + String(cfg.ledR) + ",";
   json += "\"ledG\":"       + String(cfg.ledG) + ",";
-  json += "\"ledB\":"       + String(cfg.ledB);
+  json += "\"ledB\":"       + String(cfg.ledB) + ",";
+  json += "\"pcMac\":\""    + String(cfg.pcMac)                     + "\"";
   json += "}";
   return json;
 }
@@ -2152,7 +2303,9 @@ void handleApiSettingsGet()
   json += "\"ledDefaultR\":"  + String(cfg.ledDefaultR) + ",";
   json += "\"ledDefaultG\":"  + String(cfg.ledDefaultG) + ",";
   json += "\"ledDefaultB\":"  + String(cfg.ledDefaultB) + ",";
-  json += "\"ledDefaultSpeed\":" + String(cfg.ledDefaultSpeed);
+  json += "\"ledDefaultSpeed\":" + String(cfg.ledDefaultSpeed) + ",";
+  // WOL parameter
+  json += "\"pcMac\":\""      + String(cfg.pcMac)       + "\"";
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -2250,6 +2403,10 @@ void handleApiSettingsPost()
   if (otaPass != MASK && !otaPass.isEmpty())
     strlcpy(cfg.otaPass, otaPass.c_str(), sizeof(cfg.otaPass));
 
+  // WOL Settings
+  String pcMac = jsonStr(body, "pcMac");
+  strlcpy(cfg.pcMac, pcMac.c_str(), sizeof(cfg.pcMac));
+
   saveConfig();
 
   // Restart/setup the LED driver dynamically
@@ -2280,6 +2437,17 @@ void handleReset()
   server.send(200, "application/json", "{\"ok\":true}");
   delay(300);
   factoryReset();   // wipes EEPROM and restarts
+}
+
+// POST /api/pc/wake
+void handlePcWake()
+{
+  if (strlen(cfg.pcMac) > 0) {
+    sendWOL(cfg.pcMac);
+    server.send(200, "application/json", "{\"ok\":true}");
+  } else {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"WOL MAC not configured\"}");
+  }
 }
 
 // ── AP mode handlers ──────────────────────────────────────────
@@ -2315,7 +2483,7 @@ void handleApSave()
   int port = jsonInt(body, "mqttPort");
   cfg.mqttPort = (port > 0 && port <= 65535) ? (uint16_t)port : 1883;
 
-  cfg.configVersion = 2;
+  cfg.configVersion = 3;
   cfg.ledEnabled = true;
   cfg.ledCount = 45;
   cfg.ledDefaultBrightness = 128;
@@ -2332,6 +2500,8 @@ void handleApSave()
   cfg.ledG = 255;
   cfg.ledB = 255;
   cfg.ledSpeed = 128;
+
+  memset(cfg.pcMac, 0, sizeof(cfg.pcMac));
 
   saveConfig();
   server.send(200, "application/json", "{\"ok\":true}");
@@ -2367,7 +2537,7 @@ void setup()
     Serial.println("No config found – starting AP setup mode");
     normalMode = false;
 
-    cfg.configVersion = 2;
+    cfg.configVersion = 3;
     cfg.ledEnabled = false;
     cfg.ledCount = 45;
     cfg.ledDefaultBrightness = 128;
@@ -2384,6 +2554,8 @@ void setup()
     cfg.ledG = 255;
     cfg.ledB = 255;
     cfg.ledSpeed = 128;
+
+    memset(cfg.pcMac, 0, sizeof(cfg.pcMac));
 
     WiFi.mode(WIFI_AP);
     char apSSID[32];
@@ -2482,6 +2654,7 @@ void setup()
   server.on("/api/settings",HTTP_POST, handleApiSettingsPost);
   server.on("/api/restart", HTTP_POST, handleRestart);
   server.on("/api/reset",   HTTP_POST, handleReset);
+  server.on("/api/pc/wake",  HTTP_POST, handlePcWake);
   server.begin();
   Serial.println("Web server started on port 80");
 
